@@ -1,0 +1,14 @@
+{
+  "name": "zhizhen-db-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server for 超星发现系统 ss.zhizhen.com (school library search) as a personal literature database",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "puppeteer-core": "^24.0.0"
+  }
+}
