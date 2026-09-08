@@ -18,7 +18,13 @@ if (which === "status") {
   const r = await client.callTool({ name: "zhizhen_status", arguments: {} });
   console.log(r.content[0].text);
 } else if (which === "search") {
-  const argsObj = { query: arg, content_type: "期刊" };
+  const argsObj = { query: arg };
+  if (process.env.TYPE && process.env.TYPE !== "全部") argsObj.content_type = process.env.TYPE;
+  if (process.env.SORT && process.env.SORT !== "default") argsObj.sort = process.env.SORT;
+  if (process.env.FIELD && process.env.FIELD !== "全部字段") argsObj.field = process.env.FIELD;
+  if (process.env.YF) argsObj.year_from = parseInt(process.env.YF, 10);
+  if (process.env.YT) argsObj.year_to = parseInt(process.env.YT, 10);
+  if (process.env.PAGE) argsObj.page = parseInt(process.env.PAGE, 10);
   if (process.env.REFRESH === "1") argsObj.force_refresh = true;
   if (process.env.LINKS === "1") argsObj.include_links = true;
   if (process.env.LIMIT) argsObj.limit = parseInt(process.env.LIMIT, 10);
@@ -31,8 +37,9 @@ if (which === "status") {
     process.exit(1);
   }
   console.log(JSON.stringify({
-    ok: data.ok, 来源: data.来源, 检索词: data.meta?.检索词, 类型: data.meta?.内容类型,
-    总条数: data.meta?.总条数, 各类型: data.meta?.各类型计数, 机构: data.meta?.机构,
+    ok: data.ok, 来源: data.来源, 检索词: data.检索词, 类型: data.内容类型,
+    排序: data.排序, 字段: data.字段, 年份: data.年份范围,
+    总条数: data.总条数, 返回条数: data.返回条数,
     records: data.records?.slice(0, 2),
   }, null, 2));
   const url = data.records?.[0]?.详情链接;

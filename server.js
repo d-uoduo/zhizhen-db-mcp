@@ -10,7 +10,27 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 
 const HOME_URL = "https://ss.zhizhen.com/";
-const SEARCH_URL = (sw) => `https://ss.zhizhen.com/s?sw=${encodeURIComponent(sw)}`;
+const SORT_CODES = { collection: "1", date_asc: "2", date_desc: "3", cited: "4", relevance: "6" };
+const FIELD_CODES = { 全部字段: "Z", 主题: "Su", 题名: "T", 作者: "A", 摘要: "S", 关键词: "K", 作者单位: "O" };
+
+const SEARCH_URL = (sw, { isort, field, year_from, year_to } = {}) => {
+  const params = [];
+  const fcode = (field && FIELD_CODES[field]) || null;
+  const useAdv = !!fcode || year_from != null || year_to != null;
+  if (useAdv) {
+    const q = String(sw).replace(/['\[\]]/g, " ").replace(/\s+/g, " ").trim();
+    let adv = `((${fcode || "Z"}='${q}'))`;
+    if (year_from != null || year_to != null) {
+      adv += `AND(${year_from ?? 1000}<Y<${year_to ?? 2027})`;
+    }
+    params.push("adv=" + encodeURIComponent(adv));
+    params.push("aorp=a");
+  } else {
+    params.push("sw=" + encodeURIComponent(sw));
+  }
+  if (isort) params.push("isort=" + String(isort));
+  return `https://ss.zhizhen.com/s?${params.join("&")}`;
+};
 const PORT = Number(process.env.ZHIZHEN_DEBUG_PORT || 9333);
 const DEBUG_URL = `http://127.0.0.1:${PORT}/json/version`;
 const HEADED = process.env.ZHIZHEN_HEADLESS !== "1";
@@ -469,8 +489,9 @@ async function pageFingerprint() {
 
 /* ---------------- tool implementations ---------------- */
 
-async function doSearch({ query, content_type, page_no }) {
-  const url = SEARCH_URL(query);
+async function doSearch({ query, content_type, page_no, sort, field, year_from, year_to }) {
+  const isort = sort && SORT_CODES[sort] ? SORT_CODES[sort] : null;
+  const url = SEARCH_URL(query, { isort, field, year_from, year_to });
   await gotoTarget(url);
 
   if (content_type && content_type !== "全部") {
@@ -513,6 +534,11 @@ async function doSearch({ query, content_type, page_no }) {
     meta: {
       检索词: query,
       内容类型: content_type || "全部",
+      排序: sort || "default",
+      字段: field || "全部字段",
+      ...(year_from != null || year_to != null
+        ? { 年份范围: `${year_from ?? ""}~${year_to ?? ""}` }
+        : {}),
       页码: page_no,
       总条数: parsed.total,
       各类型计数: parsed.typeCounts,
@@ -580,6 +606,9 @@ function buildSearchPayload(data, { limit, includeLinks, cachedAt } = {}) {
     ok: true,
     检索词: meta.检索词 ?? data.query,
     内容类型: meta.内容类型 || "全部",
+    排序: meta.排序 || "default",
+    字段: meta.字段 || "全部字段",
+    ...(meta.年份范围 ? { 年份范围: meta.年份范围 } : {}),
     页码: meta.页码 || 1,
     总条数: meta.总条数 ?? null,
     返回条数: records.length,
@@ -626,28 +655,64 @@ function buildDetailPayload(data, { includeLinks, cachedAt } = {}) {
 
 /* ---------------- MCP server ---------------- */
 
-const server = new McpServer({ name: "zhizhen-db", version: "1.0.0" });
+const server = new McpServer({ name: "zhizhen-db", version: "1.1.0" });
 
 server.tool(
   "zhizhen_search",
-  "在超星发现系统（大连理工大学图书馆资源发现平台 ss.zhizhen.com）检索文献，返回精简题录：标题/类型/作者/出处/关键词/截断摘要/被引量/全文来源名/详情链接。为省 token 默认不返回长 URL 链接（include_links=true 才带全文入口链接）。摘要为列表页截断版，需完整摘要时用 zhizhen_detail。结果自动缓存 7 天，重复检索读缓存。",
+  "在超星发现系统（大连理工大学图书馆资源发现平台 ss.zhizhen.com）检索文献，返回精简题录：标题/类型/作者/出处/关键词/截断摘要/被引量/全文来源名/详情链接。可选排序(sort)、字段限定(field)、年份范围(year_from/year_to)。每页最多 15 条；扩大覆盖面的推荐做法：换更窄的检索词、同一检索词换 sort 再查一次取并集、或自行传 page 翻页（收窄检索词通常优于深翻页）。为省 token 默认不返回长 URL 链接（include_links=true 才带）。摘要为列表页截断版，需完整摘要时用 zhizhen_detail。结果自动缓存 7 天，重复检索读缓存。",
   {
     query: z.string().describe("检索词（支持多个词、支持逻辑 关键词 或 任意内容，如：氧化锌 光催化）"),
     content_type: z
       .enum(["全部", "期刊", "图书", "报纸", "学位论文", "会议论文", "专利", "标准", "科技成果", "年鉴"])
       .optional()
       .describe("限定文献内容类型，默认全部"),
-    page: z.number().int().min(1).max(99).optional().describe("结果页码，默认第 1 页（每页 15 条）"),
+    sort: z
+      .enum(["default", "collection", "date_desc", "date_asc", "cited", "relevance"])
+      .optional()
+      .describe(
+        "排序方式：default=站点默认排序, collection=馆藏优先, date_desc=出版日期降序(最新在前), date_asc=出版日期升序, cited=引文量降序(高被引在前), relevance=相关性。查经典用 cited，查最新动态用 date_desc"
+      ),
+    field: z
+      .enum(["全部字段", "题名", "主题", "关键词", "作者", "作者单位", "摘要"])
+      .optional()
+      .describe("限定检索字段，默认全部字段。检索词太宽泛时用『题名』可显著提高精度"),
+    year_from: z
+      .number()
+      .int()
+      .min(1000)
+      .max(2027)
+      .optional()
+      .describe("出版年份下限（与网页高级检索语义一致，查近年进展时常配合 year_to 使用）"),
+    year_to: z.number().int().min(1000).max(2027).optional().describe("出版年份上限"),
+    page: z
+      .number()
+      .int()
+      .min(1)
+      .max(99)
+      .optional()
+      .describe("结果页码，默认第 1 页（每页 15 条）。需要更多结果可自行传 page=2、3… 翻页"),
     limit: z.number().int().min(1).max(15).optional().describe("只返回前 N 条，默认 10 条以省 token"),
     include_links: z.boolean().optional().describe("true 时附带每条记录的完整全文入口链接（goread URL，较长，默认省略）"),
     force_refresh: z.boolean().optional().describe("true 时忽略本地缓存强制重新检索，默认使用 7 天内的缓存"),
   },
-  async ({ query, content_type, page, limit, include_links, force_refresh }) => {
+  async ({ query, content_type, page, limit, include_links, force_refresh, sort, field, year_from, year_to }) => {
     try {
       const page_no = page || 1;
       const lim = limit ?? 10;
       const links = !!include_links;
-      const key = JSON.stringify({ query, content_type: content_type || "", page: page_no });
+      if (year_from != null && year_to != null && year_from > year_to) {
+        return {
+          content: [
+            { type: "text", text: JSON.stringify({ ok: false, error: "year_from 不能大于 year_to" }) },
+          ],
+        };
+      }
+      const keyObj = { query, content_type: content_type || "", page: page_no };
+      if (sort && sort !== "default") keyObj.sort = sort;
+      if (field && field !== "全部字段") keyObj.field = field;
+      if (year_from != null) keyObj.yf = year_from;
+      if (year_to != null) keyObj.yt = year_to;
+      const key = JSON.stringify(keyObj);
       if (!force_refresh) {
         const hit = await cacheGet("search", key, SEARCH_TTL_MS);
         if (hit) {
@@ -672,7 +737,7 @@ server.tool(
           };
         }
       }
-      const res = await doSearch({ query, content_type, page_no });
+      const res = await doSearch({ query, content_type, page_no, sort, field, year_from, year_to });
       if (!res.ok) {
         return { content: [{ type: "text", text: JSON.stringify(res) }] };
       }
