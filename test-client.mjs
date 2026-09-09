@@ -19,7 +19,7 @@ if (which === "status") {
   console.log(r.content[0].text);
 } else if (which === "search") {
   const argsObj = { query: arg };
-  if (process.env.TYPE && process.env.TYPE !== "全部") argsObj.content_type = process.env.TYPE;
+  if (process.env.TYPE) argsObj.content_type = process.env.TYPE;
   if (process.env.SORT && process.env.SORT !== "default") argsObj.sort = process.env.SORT;
   if (process.env.FIELD && process.env.FIELD !== "全部字段") argsObj.field = process.env.FIELD;
   if (process.env.YF) argsObj.year_from = parseInt(process.env.YF, 10);

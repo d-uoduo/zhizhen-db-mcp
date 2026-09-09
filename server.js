@@ -59,6 +59,18 @@ let browser = null;
 let page = null;
 let profileUserAgent = null;
 
+/* 串行化所有浏览器操作：MCP 只有一个共享 page，并发调用会互相抢占导航，
+   导致结果错乱/上下文销毁。所有触达页面的操作都排进这条 Promise 链依次执行。 */
+let pageOpChain = Promise.resolve();
+function withPageLock(fn) {
+  const result = pageOpChain.then(() => fn());
+  pageOpChain = result.then(
+    () => {},
+    () => {}
+  );
+  return result;
+}
+
 async function ensureDirs() {
   await fs.mkdir(path.join(CACHE_DIR, "search"), { recursive: true });
   await fs.mkdir(path.join(CACHE_DIR, "detail"), { recursive: true });
@@ -489,7 +501,11 @@ async function pageFingerprint() {
 
 /* ---------------- tool implementations ---------------- */
 
-async function doSearch({ query, content_type, page_no, sort, field, year_from, year_to }) {
+async function doSearch(args) {
+  return withPageLock(() => doSearchInner(args));
+}
+
+async function doSearchInner({ query, content_type, page_start, page_count, sort, field, year_from, year_to }) {
   const isort = sort && SORT_CODES[sort] ? SORT_CODES[sort] : null;
   const url = SEARCH_URL(query, { isort, field, year_from, year_to });
   await gotoTarget(url);
@@ -509,25 +525,47 @@ async function doSearch({ query, content_type, page_no, sort, field, year_from, 
     await waitForResultStable(before);
   }
 
-  if (page_no > 1) {
-    const before = await pageFingerprint();
-    const ok = await page.evaluate((n) => {
-      if (typeof pageUtil?.pages !== "function") return false;
-      pageUtil.pages(String(n));
-      return true;
-    }, page_no);
-    if (!ok) return { ok: false, error: "分页函数不可用" };
-    await waitForResultStable(before);
+  const collected = [];
+  const seen = new Set();
+  let total = null;
+  let typeCounts = null;
+  let pagesFetched = 0;
+
+  for (let i = 0; i < page_count; i++) {
+    const p = page_start + i;
+    if (p > 1) {
+      const before = await pageFingerprint();
+      const ok = await page.evaluate((n) => {
+        if (typeof pageUtil?.pages !== "function") return false;
+        pageUtil.pages(String(n));
+        return true;
+      }, p);
+      if (!ok) break;
+      await waitForResultStable(before);
+    }
+    await sleep(300);
+    await expandAllAbstract();
+    const parsed = await evalRetry(SEARCH_PARSE_FN);
+    if (i === 0) {
+      total = parsed.total;
+      typeCounts = parsed.typeCounts;
+    }
+    pagesFetched++;
+    const rows = parsed.rows || [];
+    for (const r of rows) {
+      const k = r.详情链接 || r.标题;
+      if (k && seen.has(k)) continue;
+      if (k) seen.add(k);
+      collected.push(r);
+    }
+    if (rows.length < 15) break;
   }
 
-  await sleep(300);
-  await expandAllAbstract();
-  const parsed = await evalRetry(SEARCH_PARSE_FN);
   const org = await evalRetry(() => {
     const m = (document.body.innerText || "").match(/欢迎来自\s*([^\n|]+?)\s*(?:\||$)/);
     return m ? m[1].trim() : null;
   });
-  const records = parsed.rows.map((r, i) => ({ 序号: i + 1, ...r }));
+  const records = collected.map((r, i) => ({ 序号: i + 1, ...r }));
 
   return {
     ok: true,
@@ -539,9 +577,10 @@ async function doSearch({ query, content_type, page_no, sort, field, year_from, 
       ...(year_from != null || year_to != null
         ? { 年份范围: `${year_from ?? ""}~${year_to ?? ""}` }
         : {}),
-      页码: page_no,
-      总条数: parsed.total,
-      各类型计数: parsed.typeCounts,
+      页码: page_start,
+      抓取页数: pagesFetched,
+      总条数: total,
+      各类型计数: typeCounts,
       机构: org,
       解析条数: records.length,
     },
@@ -549,7 +588,11 @@ async function doSearch({ query, content_type, page_no, sort, field, year_from, 
   };
 }
 
-async function doDetail({ detail_url }) {
+async function doDetail(args) {
+  return withPageLock(() => doDetailInner(args));
+}
+
+async function doDetailInner({ detail_url }) {
   await gotoTarget(detail_url);
   await sleep(400);
   await expandAllAbstract();
@@ -605,11 +648,12 @@ function buildSearchPayload(data, { limit, includeLinks, cachedAt } = {}) {
   const payload = {
     ok: true,
     检索词: meta.检索词 ?? data.query,
-    内容类型: meta.内容类型 || "全部",
+    内容类型: meta.内容类型 || "期刊",
     排序: meta.排序 || "default",
     字段: meta.字段 || "全部字段",
     ...(meta.年份范围 ? { 年份范围: meta.年份范围 } : {}),
     页码: meta.页码 || 1,
+    ...(meta.抓取页数 > 1 ? { 抓取页数: meta.抓取页数 } : {}),
     总条数: meta.总条数 ?? null,
     返回条数: records.length,
     全文来源较多时可阅读record的详情链接获取完整信息: "摘要为平台截断版，需深入理解时对选中记录调用 zhizhen_detail",
@@ -655,17 +699,19 @@ function buildDetailPayload(data, { includeLinks, cachedAt } = {}) {
 
 /* ---------------- MCP server ---------------- */
 
-const server = new McpServer({ name: "zhizhen-db", version: "1.1.0" });
+const server = new McpServer({ name: "zhizhen-db", version: "1.2.0" });
 
 server.tool(
   "zhizhen_search",
-  "在超星发现系统（大连理工大学图书馆资源发现平台 ss.zhizhen.com）检索文献，返回精简题录：标题/类型/作者/出处/关键词/截断摘要/被引量/全文来源名/详情链接。可选排序(sort)、字段限定(field)、年份范围(year_from/year_to)。每页最多 15 条；扩大覆盖面的推荐做法：换更窄的检索词、同一检索词换 sort 再查一次取并集、或自行传 page 翻页（收窄检索词通常优于深翻页）。为省 token 默认不返回长 URL 链接（include_links=true 才带）。摘要为列表页截断版，需完整摘要时用 zhizhen_detail。结果自动缓存 7 天，重复检索读缓存。",
+  "在超星发现系统（大连理工大学图书馆资源发现平台 ss.zhizhen.com）检索文献，返回精简题录：标题/类型/作者/出处/关键词/截断摘要/被引量/全文来源名/详情链接。默认检索期刊论文（超星默认排序对中文图书/工具书加权很强，故默认 content_type=期刊；需要学位论文/会议论文/图书时显式指定）。可选排序(sort)、字段限定(field)、年份范围(year_from/year_to)、返回条数(limit)。limit 可设 1-45，超过 15 时工具会自动连续翻页（无需手动传 page）。扩大覆盖面的推荐做法：换更窄的检索词、同一检索词换 sort 再查一次取并集。为省 token 默认不返回长 URL 链接（include_links=true 才带）。摘要为列表页截断版，需完整摘要时用 zhizhen_detail。结果自动缓存 7 天，重复检索读缓存。",
   {
     query: z.string().describe("检索词（支持多个词、支持逻辑 关键词 或 任意内容，如：氧化锌 光催化）"),
     content_type: z
       .enum(["全部", "期刊", "图书", "报纸", "学位论文", "会议论文", "专利", "标准", "科技成果", "年鉴"])
       .optional()
-      .describe("限定文献内容类型，默认全部"),
+      .describe(
+        "文献内容类型，默认『期刊』（论文优先）。超星默认排序对中文图书/工具书加权很强，查论文请保持默认或显式指定；需要图书/学位论文/会议论文/专利等再显式传入"
+      ),
     sort: z
       .enum(["default", "collection", "date_desc", "date_asc", "cited", "relevance"])
       .optional()
@@ -690,8 +736,14 @@ server.tool(
       .min(1)
       .max(99)
       .optional()
-      .describe("结果页码，默认第 1 页（每页 15 条）。需要更多结果可自行传 page=2、3… 翻页"),
-    limit: z.number().int().min(1).max(15).optional().describe("只返回前 N 条，默认 10 条以省 token"),
+      .describe("起始页码，默认 1。一般用 limit 控制深度即可；需要从中间页开始时才传 page"),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(45)
+      .optional()
+      .describe("返回条数，默认 10，最大 45。超过 15 时自动连续翻页抓取（不用手动传 page），每页 15 条"),
     include_links: z.boolean().optional().describe("true 时附带每条记录的完整全文入口链接（goread URL，较长，默认省略）"),
     force_refresh: z.boolean().optional().describe("true 时忽略本地缓存强制重新检索，默认使用 7 天内的缓存"),
   },
@@ -699,6 +751,8 @@ server.tool(
     try {
       const page_no = page || 1;
       const lim = limit ?? 10;
+      const pageCount = lim <= 15 ? 1 : Math.min(3, Math.ceil(lim / 15));
+      const ctype = content_type || "期刊";
       const links = !!include_links;
       if (year_from != null && year_to != null && year_from > year_to) {
         return {
@@ -707,7 +761,8 @@ server.tool(
           ],
         };
       }
-      const keyObj = { query, content_type: content_type || "", page: page_no };
+      const keyObj = { query, content_type: ctype, page: page_no };
+      if (pageCount > 1) keyObj.pages = pageCount;
       if (sort && sort !== "default") keyObj.sort = sort;
       if (field && field !== "全部字段") keyObj.field = field;
       if (year_from != null) keyObj.yf = year_from;
@@ -737,7 +792,7 @@ server.tool(
           };
         }
       }
-      const res = await doSearch({ query, content_type, page_no, sort, field, year_from, year_to });
+      const res = await doSearch({ query, content_type: ctype, page_start: page_no, page_count: pageCount, sort, field, year_from, year_to });
       if (!res.ok) {
         return { content: [{ type: "text", text: JSON.stringify(res) }] };
       }
@@ -836,16 +891,19 @@ server.tool(
   {},
   async () => {
     try {
-      await ensureBrowser();
-      let info;
-      try {
-        info = await page.evaluate(TEXT_DUMP_FN, 600);
-      } catch {
-        info = null;
-      }
-      const org = info ? (info.text.match(/欢迎来自\s*([^\n|]+?)\s*(?:\||$)/) || [])[1]?.trim() : null;
       const list = await cacheList();
-      const ver = await page.evaluate(() => navigator.userAgent);
+      const { info, ver } = await withPageLock(async () => {
+        await ensureBrowser();
+        let info = null;
+        try {
+          info = await page.evaluate(TEXT_DUMP_FN, 600);
+        } catch {
+          info = null;
+        }
+        const ver = await page.evaluate(() => navigator.userAgent);
+        return { info, ver };
+      });
+      const org = info ? (info.text.match(/欢迎来自\s*([^\n|]+?)\s*(?:\||$)/) || [])[1]?.trim() : null;
       return {
         content: [
           {
@@ -889,9 +947,11 @@ server.tool(
       if (!/^https:\/\/(ss\.)?zhizhen\.com\//.test(url) && !url.startsWith("https://ss.zhizhen.com")) {
         url = url.replace(/^https?:\/\/[^/]+/, "https://ss.zhizhen.com");
       }
-      await gotoTarget(url);
       const max = max_chars || 6000;
-      const info = await page.evaluate(TEXT_DUMP_FN, max);
+      const info = await withPageLock(async () => {
+        await gotoTarget(url);
+        return page.evaluate(TEXT_DUMP_FN, max);
+      });
       return {
         content: [
           {
