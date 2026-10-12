@@ -631,11 +631,11 @@ function compactSearchRecord(r, includeLinks) {
     关键词: r.关键词 || r.主题词,
     摘要: r.摘要,
     被引量: r.被引量,
-    详情链接: cleanDetailUrl(r.详情链接) || undefined,
-    全文来源: sourceNames(r) || undefined,
   };
-  if (includeLinks && Array.isArray(r.全文获取) && r.全文获取.length) {
-    o.全文链接 = r.全文获取;
+  if (includeLinks) {
+    o.详情链接 = cleanDetailUrl(r.详情链接) || undefined;
+    o.全文来源 = sourceNames(r) || undefined;
+    if (Array.isArray(r.全文获取) && r.全文获取.length) o.全文链接 = r.全文获取;
   }
   for (const k of Object.keys(o)) if (o[k] === undefined) delete o[k];
   return o;
@@ -656,10 +656,11 @@ function buildSearchPayload(data, { limit, includeLinks, cachedAt } = {}) {
     ...(meta.抓取页数 > 1 ? { 抓取页数: meta.抓取页数 } : {}),
     总条数: meta.总条数 ?? null,
     返回条数: records.length,
-    全文来源较多时可阅读record的详情链接获取完整信息: "摘要为平台截断版，需深入理解时对选中记录调用 zhizhen_detail",
+    提示: includeLinks
+      ? "摘要为平台截断版；records 已含 详情链接 与全文入口，可对选中记录调用 zhizhen_detail"
+      : "摘要为平台截断版；需看某条完整信息时，先带 include_links=true 重新检索（走本地缓存、即时）取回详情链接，再调 zhizhen_detail",
     records,
   };
-  if (includeLinks) payload.提示 = "已开启 include_links，records 含完整全文入口链接";
   if (cachedAt) payload.缓存时间 = cachedAt;
   return payload;
 }
@@ -678,10 +679,10 @@ function compactDetailRecord(d, includeLinks) {
     摘要: d.摘要,
     基金: d.基金,
     重要收录: d.重要收录,
-    全文来源: sourceNames(d) || undefined,
     引证或参考文献: Array.isArray(d.引证或参考文献) ? d.引证或参考文献.slice(0, 8) : undefined,
   };
   if (includeLinks) {
+    o.全文来源 = sourceNames(d) || undefined;
     if (Array.isArray(d.全文获取) && d.全文获取.length) o.全文链接 = d.全文获取;
   }
   for (const k of Object.keys(o)) if (o[k] === undefined || o[k] === "") delete o[k];
@@ -699,11 +700,11 @@ function buildDetailPayload(data, { includeLinks, cachedAt } = {}) {
 
 /* ---------------- MCP server ---------------- */
 
-const server = new McpServer({ name: "zhizhen-db", version: "1.2.0" });
+const server = new McpServer({ name: "zhizhen-db", version: "1.2.1" });
 
 server.tool(
   "zhizhen_search",
-  "在超星发现系统（大连理工大学图书馆资源发现平台 ss.zhizhen.com）检索文献，返回精简题录：标题/类型/作者/出处/关键词/截断摘要/被引量/全文来源名/详情链接。默认检索期刊论文（超星默认排序对中文图书/工具书加权很强，故默认 content_type=期刊；需要学位论文/会议论文/图书时显式指定）。可选排序(sort)、字段限定(field)、年份范围(year_from/year_to)、返回条数(limit)。limit 可设 1-45，超过 15 时工具会自动连续翻页（无需手动传 page）。扩大覆盖面的推荐做法：换更窄的检索词、同一检索词换 sort 再查一次取并集。为省 token 默认不返回长 URL 链接（include_links=true 才带）。摘要为列表页截断版，需完整摘要时用 zhizhen_detail。结果自动缓存 7 天，重复检索读缓存。",
+  "在超星发现系统（大连理工大学图书馆资源发现平台 ss.zhizhen.com）检索文献，返回精简题录：标题/类型/作者/出处/关键词/截断摘要/被引量。默认检索期刊论文（超星默认排序对中文图书/工具书加权很强，故默认 content_type=期刊；需要学位论文/会议论文/图书时显式指定）。可选排序(sort)、字段限定(field)、年份范围(year_from/year_to)、返回条数(limit)。limit 可设 1-45，超过 15 时工具会自动连续翻页（无需手动传 page）。扩大覆盖面的推荐做法：换更窄的检索词、同一检索词换 sort 再查一次取并集。为省 token 默认不返回 详情链接/全文来源/全文链接；需要看某条完整信息时，带 include_links=true 重新检索一次（走本地缓存、即时）取回 详情链接，再调 zhizhen_detail。结果自动缓存 7 天，重复检索读缓存。",
   {
     query: z.string().describe("检索词（支持多个词、支持逻辑 关键词 或 任意内容，如：氧化锌 光催化）"),
     content_type: z
@@ -744,7 +745,7 @@ server.tool(
       .max(45)
       .optional()
       .describe("返回条数，默认 10，最大 45。超过 15 时自动连续翻页抓取（不用手动传 page），每页 15 条"),
-    include_links: z.boolean().optional().describe("true 时附带每条记录的完整全文入口链接（goread URL，较长，默认省略）"),
+    include_links: z.boolean().optional().describe("true 时附带每条记录的 详情链接、全文来源 与完整全文入口链接（goread URL）。默认省略以省 token；查看某条详情前需先带此参数检索"),
     force_refresh: z.boolean().optional().describe("true 时忽略本地缓存强制重新检索，默认使用 7 天内的缓存"),
   },
   async ({ query, content_type, page, limit, include_links, force_refresh, sort, field, year_from, year_to }) => {
@@ -783,9 +784,7 @@ server.tool(
                       includeLinks: links,
                       cachedAt: new Date(hit._savedAt).toLocaleString("zh-CN"),
                     }),
-                  },
-                  null,
-                  2
+                  }
                 ),
               },
             ],
@@ -802,9 +801,7 @@ server.tool(
           {
             type: "text",
             text: JSON.stringify(
-              { 来源: "实时抓取", ...buildSearchPayload(res, { limit: lim, includeLinks: links }) },
-              null,
-              2
+              { 来源: "实时抓取", ...buildSearchPayload(res, { limit: lim, includeLinks: links }) }
             ),
           },
         ],
@@ -814,7 +811,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: JSON.stringify({ ok: false, error: String(err.message || err) }, null, 2),
+            text: JSON.stringify({ ok: false, error: String(err.message || err) }),
           },
         ],
       };
@@ -824,10 +821,10 @@ server.tool(
 
 server.tool(
   "zhizhen_detail",
-  "打开超星发现的文献详情页（先检索拿到详情链接），返回精简版完整信息：标题/类型/作者及单位/出处(刊名 年 卷期 页码)/关键词/完整摘要/基金/重要收录/引证或参考文献(至多8条)。为省 token 不返回长全文链接（include_links=true 才带）。结果缓存 30 天。",
+  "打开超星发现的文献详情页，返回精简版完整信息：标题/类型/作者及单位/出处(刊名 年 卷期 页码)/关键词/完整摘要/基金/重要收录/引证或参考文献(至多8条)。入参 detail_url 需先用 zhizhen_search 并带 include_links=true 检索取得（搜索默认不含链接）。为省 token 默认不返回 全文来源/全文链接（本工具传 include_links=true 才带）。结果缓存 30 天。",
   {
     detail_url: z.string().describe("检索结果里记录的『详情链接』，形如 https://ss.zhizhen.com/detail_xxxxxxxx?"),
-    include_links: z.boolean().optional().describe("true 时附带全文入口链接（goread URL，较长，默认省略）"),
+    include_links: z.boolean().optional().describe("true 时附带 全文来源 与全文入口链接（goread URL）。默认省略以省 token"),
     force_refresh: z.boolean().optional().describe("true 时忽略缓存强制重新抓取详情页"),
   },
   async ({ detail_url, include_links, force_refresh }) => {
@@ -851,9 +848,7 @@ server.tool(
               {
                 type: "text",
                 text: JSON.stringify(
-                  { 来源: "本地缓存", ...buildDetailPayload(hit, { includeLinks: links, cachedAt: new Date(hit._savedAt).toLocaleString("zh-CN") }) },
-                  null,
-                  2
+                  { 来源: "本地缓存", ...buildDetailPayload(hit, { includeLinks: links, cachedAt: new Date(hit._savedAt).toLocaleString("zh-CN") }) }
                 ),
               },
             ],
@@ -868,9 +863,7 @@ server.tool(
           {
             type: "text",
             text: JSON.stringify(
-              { 来源: "实时抓取", ...buildDetailPayload(res, { includeLinks: links }) },
-              null,
-              2
+              { 来源: "实时抓取", ...buildDetailPayload(res, { includeLinks: links }) }
             ),
           },
         ],
@@ -878,7 +871,7 @@ server.tool(
     } catch (err) {
       return {
         content: [
-          { type: "text", text: JSON.stringify({ ok: false, error: String(err.message || err) }, null, 2) },
+          { type: "text", text: JSON.stringify({ ok: false, error: String(err.message || err) }) },
         ],
       };
     }
@@ -918,9 +911,7 @@ server.tool(
                 缓存目录: CACHE_DIR,
                 缓存条目数: list.length,
                 缓存明细: list.slice(-15),
-              },
-              null,
-              2
+              }
             ),
           },
         ],
@@ -928,7 +919,7 @@ server.tool(
     } catch (err) {
       return {
         content: [
-          { type: "text", text: JSON.stringify({ ok: false, error: String(err.message || err) }, null, 2) },
+          { type: "text", text: JSON.stringify({ ok: false, error: String(err.message || err) }) },
         ],
       };
     }
@@ -956,14 +947,14 @@ server.tool(
         content: [
           {
             type: "text",
-            text: JSON.stringify({ ok: true, url: info.url, 标题: info.title, 正文: info.text }, null, 2),
+            text: JSON.stringify({ ok: true, url: info.url, 标题: info.title, 正文: info.text }),
           },
         ],
       };
     } catch (err) {
       return {
         content: [
-          { type: "text", text: JSON.stringify({ ok: false, error: String(err.message || err) }, null, 2) },
+          { type: "text", text: JSON.stringify({ ok: false, error: String(err.message || err) }) },
         ],
       };
     }
